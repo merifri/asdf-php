@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+_check_platform() {
+  local platform="$(uname | tr '[:upper:]' '[:lower:]')"
+
+  case "$platform" in
+    linux|darwin)
+    echo "Platform '${platform}' supported!" >&2
+    ;;
+    *)
+    echo "Platform '${platform}' not supported!" >&2
+    exit 1
+    ;;
+  esac
+}
+
+install_php() {
+  local install_type=$1
+  local version=$2
+  local install_path=$3
+  local tempdir=$(mktemp -d)
+
+  # check requirements
+  _check_platform
+  _check_required_pkgs
+
+  if [ "$install_type" = "ref" ]; then
+    local file_basename="${version}"
+  else
+    local file_basename="php-${version}"
+  fi
+
+  local configure_options="$(construct_configure_options $install_path)"
+
+  # download source
+  curl -L "https://github.com/php/php-src/archive/${file_basename}.tar.gz" -o "${tempdir}/archive.tar.gz"
+  tar -C "${tempdir}" -xzf "${tempdir}/archive.tar.gz"
+  cd "${tempdir}/php-src-${file_basename}"
+
+  echo "PHP configure options: ${configure_options}"
+  (
+  # configure, build and install
+  ./buildconf --force || exit 1
+  ./configure $configure_options || exit 1
+  make || exit 1
+  make install || exit 1
+  )
+
+  # cleanup
+  rm -rf "${tempdir}"
+}
+
+construct_configure_options() {
+  local install_path=$1
+
+  local prefixes="--prefix=$install_path --sysconfdir=$install_path --with-config-file-path=$install_path --with-config-file-scan-dir=$install_path/conf.d"
+  local default_opts="--enable-bcmath --enable-calendar --enable-dba --enable-exif --enable-ftp --enable-intl --enable-mbregex --enable-mbstring --enable-shmop --enable-soap --enable-sockets --enable-sysvmsg --enable-sysvsem --enable-sysvshm --enable-wddx --with-mhash --with-xmlrpc --without-gmp --without-snmp --with-mysqli=mysqlnd --with-pdo-mysql=mysqlnd --enable-mysqlnd --enable-pcntl --enable-fpm --with-fpm-user=www-data --with-fpm-group=www-data"
+
+  if [ -n "${PHP_CONFIGURE_OPTIONS:-}" ]; then
+    local configure_options="${prefixes} ${default_opts} ${PHP_CONFIGURE_OPTIONS} $(get_custom_configure_opts)"
+  elif [ -n "${PHP_CONFIGURE_OPTIONS_WITHOUT_SEARCH:-}" ]; then
+    local configure_options="${prefixes} ${default_opts} ${PHP_CONFIGURE_OPTIONS_WITHOUT_SEARCH}"
+  elif [ -n "${PHP_CONFIGURE_OPTIONS_FULL:-}" ]; then
+    local configure_options="${prefixes} ${PHP_CONFIGURE_OPTIONS_FULL}"
+  else
+    local configure_options="${prefixes} ${default_opts} $(get_custom_configure_opts)"
+  fi
+
+  echo -n "$configure_options"
+}
+
+_check_required_pkgs() {
+  _ASDF_PHP_PKG_MANAGER=""
+
+  has_dpkg=$(command -v dpkg)
+  has_rpm=$(command -v rpm)
+  has_brew=$(command -v brew)
+
+  if [ -n "$has_dpkg" ] && [ -n "$has_rpm" ]; then
+    echo 'WARNING: You appear to have BOTH rpm and dpkg. This is very strange. No package checks done.'
+  elif [ -n "$has_brew" ]; then
+    _ASDF_PHP_PKG_MANAGER="brew"
+    echo "Package manager found: ${_ASDF_PHP_PKG_MANAGER}"
+    _check_brew
+  elif [ -n "$has_dpkg" ]; then
+    _ASDF_PHP_PKG_MANAGER="dpkg"
+    echo "Package manager found: ${_ASDF_PHP_PKG_MANAGER}"
+    _check_dpkg
+  elif [ -n "$has_rpm" ]; then
+    _ASDF_PHP_PKG_MANAGER="rpm"
+    echo "Package manager found: ${_ASDF_PHP_PKG_MANAGER}"
+    _check_rpm
+  fi
+}
+
+_dpkg_is_installed() {
+  dpkg-query -Wf'${db:Status-abbrev}' "$1" 2>/dev/null | grep -q '^i'
+}
+
+_check_dpkg() {
+  required=(gcc g++ make libtool re2c bison libxml2-dev curl)
+  for pkg in ${required[@]}; do
+    if ! _dpkg_is_installed "$pkg"; then
+      echo "(dpkg) WARNING: It appears that a required development package '$pkg' is not installed."
+      exit 1
+    fi
+  done
+}
+
+_rpm_is_installed() {
+  rpm --quiet -q "$1" >/dev/null 2>&1
+}
+
+_check_rpm() {
+  required=(gcc gcc-c++ make libtool re2c bison libxml2-devel curl)
+  for pkg in ${required[@]}; do
+    if ! _rpm_is_installed "$pkg"; then
+      echo "(rpm) WARNING: It appears a required development package '$pkg' is not installed."
+      exit 1
+    fi
+  done
+}
+
+_brew_is_installed() {
+  brew ls --versions "$1" >/dev/null 2>&1
+}
+
+_check_brew() {
+  required=(gcc make libtool re2c bison libxml2 curl)
+  for pkg in ${required[@]}; do
+    if ! _brew_is_installed "$pkg"; then
+      echo "(brew) WARNING: It appears a required development package '$pkg' is not installed."
+      exit 1
+    fi
+  done
+}
+
+_linux_lib_is_installed() {
+  ld -o/dev/null -l"${1}" 2>&1 | grep -vq 'ld: cannot find -l'
+}
+
+#_darwin_lib_is_installed() {
+#  ld -l"${1}" 2>&1 | grep -vq 'ld: library not found for -l'
+#}
+
+get_custom_configure_opts() {
+  local platform="$(uname | tr '[:upper:]' '[:lower:]')"
+  local configure_options=""
+  local enable_gd=""
+
+  if [[ "$platform" == "darwin" ]]; then
+    #  _brew_is_installed "curlpp" && configure_options="--with-curl"
+    # --with-webp
+    _brew_is_installed "freetype" && configure_options="${configure_options} --with-freetype"
+    _brew_is_installed "gettext" && configure_options="${configure_options} --with-gettext"
+    _brew_is_installed "libedit" && configure_options="${configure_options} --with-libedit"
+    _brew_is_installed "icu4c" && configure_options="${configure_options} --with-icu"
+    _brew_is_installed "openssl" && configure_options="${configure_options} --with-openssl"
+    _brew_is_installed "zlib" && configure_options="${configure_options} --with-zlib"
+    _brew_is_installed "readline" && configure_options="${configure_options} --with-readline"
+    _brew_is_installed "zip" && configure_options="${configure_options} --enable-zip"
+    _brew_is_installed "jpeg" && { configure_options="${configure_options} --with-jpeg"; enable_gd="yes"; }
+    _brew_is_installed "libpng" && { configure_options="${configure_options} --with-png"; enable_gd="yes"; }
+  elif [[ "$platform" == "linux" ]]; then
+    _linux_lib_is_installed "freetype" && configure_options="${configure_options} --with-freetype"
+    _linux_lib_is_installed "zip" && configure_options="${configure_options} --enable-zip"
+    _linux_lib_is_installed "curl" && configure_options="${configure_options} --with-curl"
+    _linux_lib_is_installed "edit" && configure_options="${configure_options} --with-libedit"
+    _linux_lib_is_installed "ssl" && configure_options="${configure_options} --with-openssl"
+    _linux_lib_is_installed "readline" && configure_options="${configure_options} --with-readline"
+    _linux_lib_is_installed "z" && configure_options="${configure_options} --with-zlib"
+    _linux_lib_is_installed "gettextlib" && configure_options="${configure_options} --with-gettext"
+    _linux_lib_is_installed "icudata" && configure_options="${configure_options} --with-icu"
+    _linux_lib_is_installed "jpeg" && { configure_options="${configure_options} --with-jpeg"; enable_gd="yes"; }
+    _linux_lib_is_installed "png" && { configure_options="${configure_options} --with-png"; enable_gd="yes"; }
+    _linux_lib_is_installed "webp" && { configure_options="${configure_options} --with-webp"; enable_gd="yes"; }
+  fi
+
+  [[ -n "$enable_gd" ]] && configure_options="${configure_options} --with-gd"
+
+  echo -n "$configure_options"
+}
+
+install_php $ASDF_INSTALL_TYPE $ASDF_INSTALL_VERSION $ASDF_INSTALL_PATH
